@@ -1,0 +1,12 @@
+Photos.sparsebundle/
+Photos-library-other.tar
+library.sqlite
+library.sqlite-journal
+library.sqlite-wal
+library.sqlite-shm
+manifest.jsonl
+missing.txt
+Photo Backup.app/
+scripts/__pycache__/
+**/.DS_Store
+._*

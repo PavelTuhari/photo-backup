@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PhotoBackup</title>
+<style>
+  :root { color-scheme: light; --ink: #1c1915; --muted: #5c564c; --line: #d9d0c3; --paper: #f4efe6; --mark: #9c3b2e; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--paper); color: var(--ink); font: 17px/1.5 Iowan Old Style, Palatino, Georgia, serif; }
+  header { padding: 48px 8vw 24px; border-bottom: 1px solid var(--line); }
+  h1 { font-weight: 500; font-size: 42px; letter-spacing: -0.03em; margin: 0 0 8px; }
+  header p { margin: 0; color: var(--muted); max-width: 40rem; }
+  main { display: grid; grid-template-columns: 220px 1fr; gap: 48px; padding: 32px 8vw 80px; }
+  nav a { display: block; color: var(--ink); text-decoration: none; padding: 6px 0; border-left: 2px solid transparent; padding-left: 12px; }
+  nav a:hover { border-left-color: var(--mark); }
+  section { max-width: 42rem; padding-bottom: 28px; }
+  h2 { font-size: 26px; font-weight: 500; margin: 0 0 8px; }
+  code, pre { font-family: ui-monospace, SF Mono, Menlo, monospace; font-size: 13px; }
+  pre { background: #fffdf8; border: 1px solid var(--line); padding: 14px 16px; overflow: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  td { border-top: 1px solid var(--line); padding: 6px 8px 6px 0; vertical-align: top; }
+  td:first-child { font-family: ui-monospace, SF Mono, Menlo, monospace; font-size: 13px; white-space: nowrap; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>PhotoBackup</h1>
+  <p>Копия фотоальбома с этого Mac: снимки по годам, база Photos в архиве, скрипты восстановления и просмотр.</p>
+</header>
+<main>
+  <nav>
+    <a href="#layout">Состав</a>
+    <a href="#mount">Монтирование</a>
+    <a href="#repeat">Повторить экспорт</a>
+    <a href="#restore">Восстановить альбом</a>
+    <a href="#app">Приложение</a>
+  </nav>
+  <div>
+    <section id="layout">
+      <h2>Состав</h2>
+      <table>
+        <tr><td>Photos.sparsebundle</td><td>Фото и видео в папках по году съёмки. Это APFS-образ на внешнем диске.</td></tr>
+        <tr><td>Photos-library-other.tar</td><td>База, превью и остальные части библиотеки, кроме originals.</td></tr>
+        <tr><td>manifest.jsonl</td><td>30 849 строк. Каждая связывает файл в папке года с originals/каталог/имя в библиотеке Photos.</td></tr>
+        <tr><td>missing.txt</td><td>Пять файлов, которых не было в библиотеке на диске.</td></tr>
+        <tr><td>scripts/</td><td>Экспорт, монтирование, восстановление, сборка приложения.</td></tr>
+        <tr><td>app/</td><td>Исходник приложения: PhotoBackup.swift.</td></tr>
+        <tr><td>Photo Backup.app</td><td>Просмотр смонтированной копии.</td></tr>
+      </table>
+      <p>Полная инструкция для повторения другим агентом: <a href="REPEAT.md">REPEAT.md</a>.</p>
+    </section>
+    <section id="mount">
+      <h2>Монтирование</h2>
+      <pre>bash scripts/mount_backup.sh
+bash scripts/unmount_backup.sh</pre>
+      <p>Первая команда печатает точку монтирования, обычно <code>/Volumes/Photos</code>. Повторный запуск не подключает образ второй раз.</p>
+    </section>
+    <section id="repeat">
+      <h2>Повторить экспорт</h2>
+      <p>Год берётся так: <code>ZDATECREATED + 978307200 + ZTIMEZONEOFFSET</code>, затем <code>gmtime</code>. Имя файла — исходное имя из базы. Повторы в одном году получают суффикс <code>_2</code>, <code>_3</code>. Запрос к базе без <code>ORDER BY</code>. Его нельзя сортировать.</p>
+      <pre>python3 scripts/export_photos.py \
+  --library "$HOME/Pictures/Photos Library.photoslibrary" \
+  --media /Volumes/Photos \
+  --archive Photos-library-other.tar</pre>
+    </section>
+    <section id="restore">
+      <h2>Восстановить альбом Apple</h2>
+      <pre>python3 scripts/restore_photos_library.py --dry-run
+python3 scripts/restore_photos_library.py
+open -a Photos "/Volumes/Photos/Restored Photos Library.photoslibrary"</pre>
+      <p>По умолчанию библиотека собирается внутри смонтированного образа. Файлы клонируются через <code>cp -c</code> и не занимают вторые 114 ГБ. На внутренний диск эту копию класть нельзя: там нет столько свободного места.</p>
+    </section>
+    <section id="app">
+      <h2>Приложение</h2>
+      <p>Откройте <code>Photo Backup.app</code> в этой папке. Слева годы, справа сетка. Клик открывает снимок или видео, стрелки листают. Миниатюры делает QuickLook, снимки читает ImageIO, видео играет AVKit. Это те же системные механизмы, которыми Photos показывает файл. Сама сетка не использует PhotoKit: PhotoKit видит только системную библиотеку, а не произвольную папку. Собрать заново: <code>bash scripts/build_app.sh</code>.</p>
+    </section>
+  </div>
+</main>
+</body>
+</html>
