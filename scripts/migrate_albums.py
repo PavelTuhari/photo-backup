@@ -11,7 +11,7 @@ its year/name path already exists in library.sqlite.
 
 Technical albums are recomputed each run:
 
-- technical:trash        Удалённые     files.trashed_at, not album membership
+- technical:trash        Удалённые     trash table, not album membership
 - technical:favorites    Избранное     ZFAVORITE = 1
 - technical:hidden       Скрытые       ZHIDDEN = 1
 - technical:videos       Видео         ZASSET.ZKIND = 1
@@ -19,9 +19,9 @@ Technical albums are recomputed each run:
 - technical:selfies      Селфи         ZCAMERACAPTUREDEVICE = 1
 
 Photos trash (ZTRASHEDSTATE = 1) was not part of the original copy. If such
-a file is present in the backup, trashed_at is set from ZTRASHEDDATE when
-the backup row is not already trashed. Rows the app has already trashed are
-left alone.
+a file is present in the backup, a trash row is inserted from ZTRASHEDDATE
+when that path is not already in trash. Existing trash rows are left alone.
+The stamp does not update files, so thumbnail blobs are not rewritten.
 
 The backup app must be quit first. library.sqlite uses DELETE journal mode.
 
@@ -104,6 +104,25 @@ def ensure_schema(library):
     columns = {row[1] for row in library.execute("PRAGMA table_info(files)")}
     if "trashed_at" not in columns:
         library.execute("ALTER TABLE files ADD COLUMN trashed_at REAL")
+    library.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trash (
+          path TEXT PRIMARY KEY,
+          trashed_at REAL NOT NULL
+        )
+        """
+    )
+    library.execute(
+        """
+        INSERT OR IGNORE INTO trash(path, trashed_at)
+        SELECT path, trashed_at FROM files WHERE trashed_at IS NOT NULL
+        """
+    )
+    library.execute("UPDATE files SET trashed_at=NULL WHERE trashed_at IS NOT NULL")
+    library.execute(
+        "INSERT INTO meta(key, value) VALUES ('trash_split', '1') "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+    )
     library.commit()
 
 
@@ -249,11 +268,8 @@ def main():
         created = row["ZTRASHEDDATE"]
         when = float(created) + CORE_DATA_EPOCH if created is not None else now
         changed = library.execute(
-            """
-            UPDATE files SET trashed_at=?
-            WHERE path=? AND trashed_at IS NULL
-            """,
-            (when, path),
+            "INSERT OR IGNORE INTO trash(path, trashed_at) VALUES (?, ?)",
+            (path, when),
         ).rowcount
         stamped += changed
     library.execute(

@@ -67,6 +67,8 @@ final class LibraryModel: ObservableObject {
     @Published var pixelEpoch = 0
     @Published var groupsEpoch = 0
     @Published var albumsEpoch = 0
+    /// Bumps once when the catalog is on screen and again after library.sqlite.
+    @Published var openedGeneration = 0
     var sortKeys = SortKeys()
     let indexStatus = IndexStatus()
     let indexer = Indexer()
@@ -74,7 +76,7 @@ final class LibraryModel: ObservableObject {
 
     var totalBytes: Int64 { years.reduce(0) { $0 + $1.bytes } }
 
-    func refresh() async {
+    func refresh(onOpen: @MainActor () -> Void) async {
         guard !started else { return }
         started = true
         guard let root = backupRoot() else {
@@ -85,13 +87,32 @@ final class LibraryModel: ObservableObject {
         status = "Монтирую копию"
         do {
             let bundle = root.appendingPathComponent("Photos.sparsebundle")
-            let mount = try await Task.detached { try ensureMounted(bundle: bundle) }.value
+            // The catalog has no thumbnail blobs, so the list can paint before
+            // library.sqlite is read. The year is chosen before the next frame.
+            let primed = try await Task.detached { () -> (URL, CatalogSnapshot?, SortKeys?) in
+                let mount = try ensureMounted(bundle: bundle)
+                let cached = CatalogCache.read(root: root)
+                let keys = cached.map { SortKeys.make(files: $0.files) }
+                return (mount, cached, keys)
+            }.value
+            let mount = primed.0
             mediaRoot = mount
+            if let cached = primed.1, let keys = primed.2 {
+                files = cached.files
+                years = cached.years
+                groups = cached.groups
+                groupPaths = cached.groupPaths
+                albums = cached.albums
+                albumPaths = cached.albumPaths
+                sortKeys = keys
+                status = "\(files.count) файлов · \(ByteText.string(totalBytes))"
+                openedGeneration &+= 1
+                onOpen()
+                await Task.yield()
+            }
             let database = LibraryDB(path: root.appendingPathComponent("library.sqlite").path)
-            status = "Считаю размеры папок"
+            status = files.isEmpty ? "Считаю размеры папок" : "Сверяю архив"
             let manifest = root.appendingPathComponent("manifest.jsonl")
-            // Names are ranked off the main thread. Opening the database stays
-            // off it as well, so the window can show the privacy prompt.
             let loaded = try await Task.detached {
                 try database.open()
                 let snapshot = database.syncDisk(mount: mount, manifest: manifest)
@@ -107,6 +128,8 @@ final class LibraryModel: ObservableObject {
             self.groups = groups.groups
             groupPaths = groups.paths
             reloadAlbums()
+            openedGeneration &+= 1
+            onOpen()
             if database.lastPurged > 0 {
                 status = "Корзина очищена автоматически · \(database.lastPurged)"
             } else {
@@ -123,8 +146,12 @@ final class LibraryModel: ObservableObject {
                 }
             }
         } catch {
-            status = "Не удалось открыть копию"
-            started = false
+            if files.isEmpty {
+                status = "Не удалось открыть копию"
+                started = false
+            } else {
+                status = "Каталог открыт, архив не сверен"
+            }
         }
     }
 
@@ -160,6 +187,7 @@ final class LibraryModel: ObservableObject {
         if let index = years.firstIndex(where: { $0.year == year }) {
             years[index].complete = true
         }
+        persistCatalog()
     }
 
     func reloadGroups() {
@@ -168,6 +196,7 @@ final class LibraryModel: ObservableObject {
         groups = loaded.groups
         groupPaths = loaded.paths
         groupsEpoch &+= 1
+        persistCatalog()
     }
 
     func makeGroup(name: String, paths: [String]) {
@@ -201,6 +230,7 @@ final class LibraryModel: ObservableObject {
         albums = loaded.albums
         albumPaths = loaded.paths
         albumsEpoch &+= 1
+        persistCatalog()
     }
 
     func createAlbum(name: String, paths: [String]) {
@@ -236,31 +266,139 @@ final class LibraryModel: ObservableObject {
 
     func setTrashed(_ paths: [String], at time: TimeInterval) {
         guard let database, !paths.isEmpty else { return }
-        database.setTrashed(paths, at: time)
         let wanted = Set(paths)
+        let affected = files.filter { file in
+            guard wanted.contains(file.path) else { return false }
+            if time == 0 { return file.trashedAt != 0 }
+            return file.trashedAt == 0
+        }
+        guard !affected.isEmpty else { return }
+        database.setTrashed(affected.map(\.path), at: time)
+        let marked = Set(affected.map(\.path))
         var next = files
-        for index in next.indices where wanted.contains(next[index].path) {
+        for index in next.indices where marked.contains(next[index].path) {
             next[index].trashedAt = time
         }
         files = next
-        reloadAlbums()
+        noteTrash(marked, at: time)
     }
 
     func forget(_ paths: [String]) -> Int {
         guard let database, let root = mediaRoot, !paths.isEmpty else { return 0 }
         let wanted = Set(paths)
-        let doomed = files.filter { wanted.contains($0.path) }.map {
-            DiskFile(path: $0.path, year: $0.year, name: $0.name)
+        let doomed = files.filter { wanted.contains($0.path) }
+        guard !doomed.isEmpty else { return 0 }
+        var byYear: [String: (count: Int, bytes: Int64)] = [:]
+        for file in doomed {
+            let prior = byYear[file.year] ?? (0, 0)
+            byYear[file.year] = (prior.count + 1, prior.bytes + file.size)
         }
-        let removed = doomed.filter { MediaDelete.remove($0, mount: root) }.map(\.path)
-        guard !removed.isEmpty else { return 0 }
-        database.forget(removed)
+        let removed = doomed.map(\.path)
+        database.forget(removed, years: byYear)
         let gone = Set(removed)
         files.removeAll { gone.contains($0.path) }
-        reloadAlbums()
-        reloadGroups()
-        refreshYearStats()
+        for index in years.indices {
+            guard let stat = byYear[years[index].year] else { continue }
+            years[index].count = max(0, years[index].count - stat.count)
+            years[index].bytes = max(0, years[index].bytes - stat.bytes)
+        }
+        dropMembership(gone, doomed: doomed)
+        persistCatalog()
+        let mount = root
+        let disk = doomed.map { DiskFile(path: $0.path, year: $0.year, name: $0.name) }
+        DispatchQueue.global(qos: .utility).async {
+            for file in disk {
+                _ = MediaDelete.remove(file, mount: mount)
+            }
+        }
         return removed.count
+    }
+
+    /// Album path sets keep trashed members. Only the trash set and the visible counts change.
+    private func noteTrash(_ paths: Set<String>, at time: TimeInterval) {
+        guard let trash = albums.first(where: \.isTrash) else {
+            reloadAlbums()
+            return
+        }
+        let entering = time != 0
+        var nextPaths = albumPaths
+        var bin = nextPaths[trash.id] ?? []
+        if entering {
+            bin.formUnion(paths)
+        } else {
+            bin.subtract(paths)
+        }
+        nextPaths[trash.id] = bin
+        albumPaths = nextPaths
+        var next = albums
+        for index in next.indices {
+            if next[index].id == trash.id {
+                next[index].count = bin.count
+                continue
+            }
+            let hit = (nextPaths[next[index].id] ?? []).intersection(paths).count
+            guard hit > 0 else { continue }
+            if entering {
+                next[index].count = max(0, next[index].count - hit)
+            } else {
+                next[index].count += hit
+            }
+        }
+        albums = next
+        persistCatalog()
+    }
+
+    private func persistCatalog() {
+        guard !files.isEmpty, let root = backupRoot() else { return }
+        CatalogCache.writeAsync(root: root, snapshot: CatalogSnapshot(
+            files: files,
+            years: years,
+            groups: groups,
+            groupPaths: groupPaths,
+            albums: albums,
+            albumPaths: albumPaths
+        ))
+    }
+
+    private func dropMembership(_ gone: Set<String>, doomed: [FileRecord]) {
+        let live = Set(doomed.filter { $0.trashedAt == 0 }.map(\.path))
+        let trashed = Set(doomed.filter { $0.trashedAt != 0 }.map(\.path))
+        var nextPaths = albumPaths
+        var albumHits: [Int64: (live: Int, trashed: Int)] = [:]
+        for (id, set) in albumPaths {
+            let liveHit = set.intersection(live).count
+            let trashHit = set.intersection(trashed).count
+            if liveHit == 0, trashHit == 0 { continue }
+            albumHits[id] = (liveHit, trashHit)
+            nextPaths[id] = set.subtracting(gone)
+        }
+        albumPaths = nextPaths
+        if !albumHits.isEmpty {
+            var next = albums
+            for index in next.indices {
+                guard let hit = albumHits[next[index].id] else { continue }
+                let delta = next[index].isTrash ? hit.trashed : hit.live
+                next[index].count = max(0, next[index].count - delta)
+            }
+            albums = next
+        }
+        var nextGroups = groupPaths
+        var groupHits: [Int64: Int] = [:]
+        for (id, set) in groupPaths {
+            let hit = set.intersection(gone).count
+            if hit == 0 { continue }
+            groupHits[id] = hit
+            nextGroups[id] = set.subtracting(gone)
+        }
+        groupPaths = nextGroups
+        if !groupHits.isEmpty {
+            var next = groups
+            for index in next.indices {
+                guard let hit = groupHits[next[index].id] else { continue }
+                next[index].count = max(0, next[index].count - hit)
+            }
+            groups = next
+        }
     }
 
     func purgeExpired() -> Int {
@@ -271,6 +409,7 @@ final class LibraryModel: ObservableObject {
         files.removeAll { doomed.contains($0.path) }
         reloadAlbums()
         refreshYearStats()
+        persistCatalog()
         return n
     }
 
@@ -318,6 +457,8 @@ struct BrowserView: View {
     @State private var tableScrollToken = 0
     @State private var viewerList: [FileRecord] = []
     @State private var resizeToken = 0
+    @AppStorage("pb.showYears") private var showYears = true
+    @AppStorage("pb.showGroups") private var showGroups = true
     @AppStorage("pb.showAlbums") private var showAlbums = true
     @State private var albumName = ""
     @State private var makingAlbum = false
@@ -402,12 +543,13 @@ struct BrowserView: View {
         .preferredColorScheme(.dark)
         .toolbar { toolbar }
         .task {
-            await model.refresh()
-            if !didPickYear, let year = model.years.first?.year {
-                sidebar = .year(year)
-                didPickYear = true
+            await model.refresh {
+                if !didPickYear, let year = model.years.first?.year {
+                    sidebar = .year(year)
+                    didPickYear = true
+                }
+                reorderTable()
             }
-            reorderTable()
         }
         .onChange(of: sidebar) { _, _ in reorderTable() }
         .onChange(of: query) { _, _ in reorderTable() }
@@ -461,50 +603,66 @@ struct BrowserView: View {
                         .foregroundStyle(.secondary)
                 }
                 .tag(SidebarItem.all)
-                ForEach(model.years) { year in
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack {
-                            Text(year.year)
-                            if year.complete {
-                                Image(systemName: "checkmark")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                disclosureRow("Годы", open: showYears) {
+                    showYears.toggle()
+                    if !showYears, case .year = sidebar { sidebar = .all }
+                }
+                if showYears {
+                    ForEach(model.years) { year in
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack {
+                                Text(year.year)
+                                if year.complete {
+                                    Image(systemName: "checkmark")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            Text("\(year.count) · \(ByteText.string(year.bytes))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                        .tag(SidebarItem.year(year.year))
+                        .listRowBackground(
+                            sidebar == .all && focusYear == year.year
+                                ? Color.accentColor.opacity(0.28)
+                                : Color.clear
+                        )
+                        .contextMenu {
+                            Button("Показать") { sidebar = .year(year.year) }
+                        }
+                    }
+                }
+            }
+            Section {
+                disclosureRow("Группы", open: showGroups) {
+                    showGroups.toggle()
+                    if !showGroups, case .group = sidebar { sidebar = .all }
+                }
+                if showGroups {
+                    ForEach(model.groups) { group in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(group.name)
+                            Text("\(group.count)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .tag(SidebarItem.group(group.id))
+                        .contextMenu {
+                            Button("Удалить группу") {
+                                model.deleteGroup(group.id)
+                                if sidebar == .group(group.id) { sidebar = .all }
                             }
                         }
-                        Text("\(year.count) · \(ByteText.string(year.bytes))")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                    }
-                    .tag(SidebarItem.year(year.year))
-                    .listRowBackground(
-                        sidebar == .all && focusYear == year.year
-                            ? Color.accentColor.opacity(0.28)
-                            : Color.clear
-                    )
-                    .contextMenu {
-                        Button("Показать") { sidebar = .year(year.year) }
                     }
                 }
             }
-            Section("Группы") {
-                ForEach(model.groups) { group in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(group.name)
-                        Text("\(group.count)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .tag(SidebarItem.group(group.id))
-                    .contextMenu {
-                        Button("Удалить группу") {
-                            model.deleteGroup(group.id)
-                            if sidebar == .group(group.id) { sidebar = .all }
-                        }
-                    }
+            Section {
+                disclosureRow("Альбомы", open: showAlbums) {
+                    showAlbums.toggle()
+                    if !showAlbums, case .album = sidebar { sidebar = .all }
                 }
-            }
-            Section("Альбомы") {
                 if showAlbums {
                     ForEach(model.userAlbums) { album in
                         albumRow(album)
@@ -513,13 +671,6 @@ struct BrowserView: View {
                         albumRow(album)
                     }
                 }
-                Button(showAlbums ? "Скрыть альбомы" : "Показать альбомы") {
-                    showAlbums.toggle()
-                    if !showAlbums, case .album = sidebar { sidebar = .all }
-                }
-                .buttonStyle(.plain)
-                .font(.caption)
-                .foregroundStyle(.secondary)
             }
             Section("База") {
                 Label("SQLite", systemImage: "tablecells")
@@ -528,11 +679,39 @@ struct BrowserView: View {
         }
         .navigationSplitViewColumnWidth(min: 190, ideal: 230, max: 320)
         .safeAreaInset(edge: .bottom) {
-            Text("Размеры и миниатюры считаются один раз")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .padding(8)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(appVersionLabel)
+                Text("Размеры и миниатюры считаются один раз")
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(8)
         }
+    }
+
+    private var appVersionLabel: String {
+        let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
+        if short.isEmpty { return "Сборка \(build)" }
+        return "Версия \(short) · сборка \(build)"
+    }
+
+    private func disclosureRow(_ title: String, open: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: open ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 12)
+                Text(title)
+                    .font(.callout.weight(.semibold))
+                Spacer()
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .selectionDisabled(true)
     }
 
     private var userAlbumOpen: Bool {
@@ -1025,7 +1204,7 @@ struct BrowserView: View {
                         }
                         .id(file.path)
                         .onTapGesture {
-                            selection = [file.path]
+                            select(file.path)
                             if case .all = sidebar {
                                 noteFocus(file)
                             } else if let month = CaptureCalendar.month(file.created) {
@@ -1502,8 +1681,14 @@ struct BrowserView: View {
     }
 
     private func reorderTable(column: HardwareColumn? = nil, descending: Bool? = nil) {
-        rebuildMonths()
-        rebuildMosaic()
+        switch sidebar {
+        case .year:
+            rebuildMonths()
+        case .all:
+            rebuildMosaic()
+        default:
+            break
+        }
         if let column { activeColumn = column }
         if let descending { sortDescending = descending }
         let files = model.files
@@ -1574,13 +1759,23 @@ struct BrowserView: View {
         tableToken &+= 1
     }
 
+    private func selectionOrder() -> [FileRecord] {
+        if mode == .table, !tableOrder.isEmpty {
+            return tableOrder.map { live($0) }
+        }
+        if case .all = sidebar, !mosaic.files.isEmpty, mode != .table {
+            return mosaic.files
+        }
+        return browserFiles
+    }
+
     private func select(_ path: String) {
         let flags = NSEvent.modifierFlags
         if flags.contains(.command) {
             if selection.contains(path) { selection.remove(path) } else { selection.insert(path) }
             anchor = path
         } else if flags.contains(.shift), let anchor {
-            let ordered = mode == .table && !tableOrder.isEmpty ? tableOrder.map { live($0) } : browserFiles
+            let ordered = selectionOrder()
             if let start = ordered.firstIndex(where: { $0.path == anchor }),
                let end = ordered.firstIndex(where: { $0.path == path }) {
                 let slice = ordered[min(start, end)...max(start, end)]
@@ -1786,7 +1981,7 @@ struct CachedThumb: View {
             }
         }
         .clipped()
-        .task(id: path) { await load() }
+        .task(id: (db == nil ? "0" : "1") + path) { await load() }
     }
 
     private func load() async {
@@ -1831,23 +2026,193 @@ struct CachedThumb: View {
 struct StillPhoto: View {
     let url: URL
     var maxPixel: Int
-    @State private var image: NSImage?
+    @State private var ready = false
 
     var body: some View {
-        Group {
-            if let image {
-                Image(nsImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .padding(12)
-            } else {
+        ZStack {
+            ZoomPhoto(url: url, maxPixel: maxPixel) { ready = $0 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if !ready {
                 ProgressView()
+                    .controlSize(.small)
+                    .allowsHitTesting(false)
             }
         }
-        .task(id: url) {
-            let pixels = maxPixel
-            let data = await Task.detached { previewJPEG(url: url, maxPixel: pixels) }.value
-            image = data.flatMap { NSImage(data: $0) }
+        .onChange(of: url) { _, _ in ready = false }
+    }
+}
+
+/// Scale 1 is aspect-fit. The view is not flipped: scrollingDeltaY is positive upward, so the photo follows the fingers.
+final class ZoomCanvas: NSView {
+    var image: NSImage? {
+        didSet { needsDisplay = true }
+    }
+
+    private var userScale: CGFloat = 1
+    private var pan = CGPoint.zero
+    private let maxScale: CGFloat = 12
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+    }
+
+    override var isOpaque: Bool { false }
+
+    func resetZoom() {
+        userScale = 1
+        pan = .zero
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let image, image.size.width > 0, image.size.height > 0 else { return }
+        NSGraphicsContext.current?.imageInterpolation = .high
+        image.draw(in: imageRect(), from: .zero, operation: .sourceOver, fraction: 1)
+    }
+
+    override func magnify(with event: NSEvent) {
+        let factor = 1 + event.magnification
+        guard factor.isFinite, factor > 0 else { return }
+        zoom(by: factor, at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func smartMagnify(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if userScale > 1.05 {
+            resetZoom()
+        } else {
+            zoom(by: 2, at: point)
+        }
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard image != nil, userScale > 1 else {
+            super.scrollWheel(with: event)
+            return
+        }
+        let unit: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 12
+        pan.x += event.scrollingDeltaX * unit
+        pan.y += event.scrollingDeltaY * unit
+        clampPan()
+        needsDisplay = true
+    }
+
+    override func layout() {
+        super.layout()
+        clampPan()
+    }
+
+    private func fittedRect() -> NSRect {
+        guard let image else { return bounds }
+        let available = bounds.insetBy(dx: 12, dy: 12)
+        let size = image.size
+        guard size.width > 0, size.height > 0, available.width > 1, available.height > 1 else { return bounds }
+        let aspect = size.width / size.height
+        var width = available.width
+        var height = width / aspect
+        if height > available.height {
+            height = available.height
+            width = height * aspect
+        }
+        return NSRect(x: available.midX - width / 2, y: available.midY - height / 2, width: width, height: height)
+    }
+
+    private func imageRect() -> NSRect {
+        let fit = fittedRect()
+        let width = fit.width * userScale
+        let height = fit.height * userScale
+        return NSRect(x: fit.midX - width / 2 + pan.x, y: fit.midY - height / 2 + pan.y, width: width, height: height)
+    }
+
+    private func zoom(by factor: CGFloat, at point: NSPoint) {
+        guard image != nil, bounds.width > 1, bounds.height > 1 else { return }
+        let old = imageRect()
+        guard old.width > 1, old.height > 1 else { return }
+        let next = min(maxScale, max(1, userScale * factor))
+        let applied = next / userScale
+        guard applied.isFinite, applied > 0 else { return }
+        userScale = next
+        if userScale <= 1.001 {
+            resetZoom()
+            return
+        }
+        let newX = point.x - (point.x - old.origin.x) * applied
+        let newY = point.y - (point.y - old.origin.y) * applied
+        let fit = fittedRect()
+        pan.x = newX + old.width * applied / 2 - fit.midX
+        pan.y = newY + old.height * applied / 2 - fit.midY
+        clampPan()
+        needsDisplay = true
+    }
+
+    private func clampPan() {
+        guard userScale > 1, image != nil else {
+            if userScale <= 1 { pan = .zero }
+            return
+        }
+        let rect = imageRect()
+        var dx: CGFloat = 0
+        var dy: CGFloat = 0
+        if rect.width <= bounds.width {
+            dx = bounds.midX - rect.midX
+        } else if rect.minX > bounds.minX {
+            dx = bounds.minX - rect.minX
+        } else if rect.maxX < bounds.maxX {
+            dx = bounds.maxX - rect.maxX
+        }
+        if rect.height <= bounds.height {
+            dy = bounds.midY - rect.midY
+        } else if rect.minY > bounds.minY {
+            dy = bounds.minY - rect.minY
+        } else if rect.maxY < bounds.maxY {
+            dy = bounds.maxY - rect.maxY
+        }
+        pan.x += dx
+        pan.y += dy
+    }
+}
+
+private struct ZoomPhoto: NSViewRepresentable {
+    let url: URL
+    var maxPixel: Int
+    var onReady: (Bool) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator {
+        var url: URL?
+        var token = 0
+        var onReady: (Bool) -> Void = { _ in }
+    }
+
+    func makeNSView(context: Context) -> ZoomCanvas {
+        let view = ZoomCanvas()
+        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        view.setContentHuggingPriority(.defaultLow, for: .vertical)
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        view.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        return view
+    }
+
+    func updateNSView(_ view: ZoomCanvas, context: Context) {
+        context.coordinator.onReady = onReady
+        guard context.coordinator.url != url else { return }
+        context.coordinator.url = url
+        context.coordinator.token &+= 1
+        let token = context.coordinator.token
+        view.image = nil
+        view.resetZoom()
+        let pixels = maxPixel
+        let target = url
+        let coordinator = context.coordinator
+        Task.detached {
+            let data = previewJPEG(url: target, maxPixel: pixels)
+            await MainActor.run {
+                guard coordinator.token == token else { return }
+                let image = data.flatMap { NSImage(data: $0) }
+                view.image = image
+                coordinator.onReady(image != nil)
+            }
         }
     }
 }
@@ -1884,27 +2249,12 @@ struct Viewer: View {
                         .contextMenu { viewerActions(item) }
                 }
             }
-            VStack {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(item.name).font(.callout).lineLimit(1)
-                        Text(DateText.string(item.created))
-                            .font(.callout.monospacedDigit())
-                        Text("\(ByteText.string(item.size)) · \(item.pixelLabel)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Text("\(index + 1) / \(items.count)").monospacedDigit()
-                    Button("Скопировать") { onCopy(item) }
-                    Button("Поделиться") { onShare(item) }
-                    Button("Выгрузить") { onExport(item) }
-                    Button("Закрыть") { dismiss() }
-                        .keyboardShortcut(.cancelAction)
-                }
-                .padding(12)
-                .contextMenu { viewerActions(item) }
+        }
+        .overlay {
+            VStack(spacing: 0) {
+                viewerBar(item)
                 Spacer()
+                    .allowsHitTesting(false)
                 HStack {
                     Button { step(-1) } label: { Image(systemName: "chevron.left") }
                         .keyboardShortcut(.leftArrow, modifiers: [])
@@ -1920,8 +2270,29 @@ struct Viewer: View {
             }
         }
         .frame(minWidth: 960, minHeight: 680)
-        .contextMenu { viewerActions(item) }
         .onAppear { index = items.firstIndex(of: start) ?? 0 }
+    }
+
+    private func viewerBar(_ item: FileRecord) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.name).font(.callout).lineLimit(1)
+                Text(DateText.string(item.created))
+                    .font(.callout.monospacedDigit())
+                Text("\(ByteText.string(item.size)) · \(item.pixelLabel)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text("\(index + 1) / \(items.count)").monospacedDigit()
+            Button("Скопировать") { onCopy(item) }
+            Button("Поделиться") { onShare(item) }
+            Button("Выгрузить") { onExport(item) }
+            Button("Закрыть") { dismiss() }
+                .keyboardShortcut(.cancelAction)
+        }
+        .padding(12)
+        .contextMenu { viewerActions(item) }
     }
 
     @ViewBuilder

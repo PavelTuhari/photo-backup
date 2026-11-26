@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import CoreGraphics
+import Darwin
 import Foundation
 import ImageIO
 import SQLite3
@@ -41,6 +42,7 @@ struct FileRecord: Identifiable, Hashable, Sendable {
     var height: Int
     var created: TimeInterval
     var trashedAt: TimeInterval = 0
+    var thumbPending: Bool = false
     var id: String { path }
 
     var pixelLabel: String {
@@ -180,35 +182,138 @@ func mountedBackup() -> URL? {
         at: URL(fileURLWithPath: "/Volumes"),
         includingPropertiesForKeys: nil
     )) ?? []
-    for volume in volumes {
-        if FileManager.default.fileExists(atPath: volume.appendingPathComponent("2015").path),
-           FileManager.default.fileExists(atPath: volume.appendingPathComponent("2024").path),
-           FileManager.default.fileExists(atPath: volume.appendingPathComponent("_missing.txt").path) {
-            return volume
+    return volumes.first(where: isBackupVolume)
+}
+
+func ensureMounted(bundle: URL) throws -> URL {
+    if let existing = mountedBackup() {
+        rememberMountDevice(bundle, volume: existing)
+        return existing
+    }
+    // The last Photos device is remembered beside the archive. Mounting that
+    // node skips enumerating every other disk image.
+    if let dev = rememberedMountDevice(bundle) {
+        _ = runStatus(launch: "/usr/sbin/diskutil", args: ["mount", dev])
+        if let existing = mountedBackup() {
+            rememberMountDevice(bundle, volume: existing)
+            return existing
         }
+    }
+    // After the disk drops, the image can stay attached while the Photos
+    // volume is gone. A second attach then fails, so mount that volume, and
+    // if it will not mount, eject the image and attach it again.
+    if let revived = mountAttachedVolume(bundle) {
+        rememberMountDevice(bundle, volume: revived)
+        return revived
+    }
+    _ = runPlist(launch: "/usr/sbin/diskutil", args: ["image", "--plist", "attach", bundle.path])
+    if let existing = mountedBackup() {
+        rememberMountDevice(bundle, volume: existing)
+        return existing
+    }
+    if let revived = mountAttachedVolume(bundle) {
+        rememberMountDevice(bundle, volume: revived)
+        return revived
+    }
+    throw CocoaError(.fileReadCorruptFile)
+}
+
+private func mountDeviceFile(_ bundle: URL) -> URL {
+    bundle.deletingLastPathComponent().appendingPathComponent("mount-device.txt")
+}
+
+private func rememberedMountDevice(_ bundle: URL) -> String? {
+    guard let text = try? String(contentsOf: mountDeviceFile(bundle), encoding: .utf8) else { return nil }
+    let dev = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard dev.hasPrefix("/dev/disk"), dev.count < 32, !dev.contains("..") else { return nil }
+    return dev
+}
+
+private func rememberMountDevice(_ bundle: URL, volume: URL) {
+    var info = statfs()
+    guard statfs(volume.path, &info) == 0 else { return }
+    let device = withUnsafeBytes(of: info.f_mntfromname) { raw -> String in
+        let chars = raw.bindMemory(to: CChar.self)
+        guard let base = chars.baseAddress else { return "" }
+        return String(cString: base)
+    }
+    guard device.hasPrefix("/dev/disk") else { return }
+    try? device.appending("\n").write(to: mountDeviceFile(bundle), atomically: true, encoding: .utf8)
+}
+
+private func isBackupVolume(_ volume: URL) -> Bool {
+    let fileManager = FileManager.default
+    return fileManager.fileExists(atPath: volume.appendingPathComponent("2015").path)
+        && fileManager.fileExists(atPath: volume.appendingPathComponent("2024").path)
+        && fileManager.fileExists(atPath: volume.appendingPathComponent("_missing.txt").path)
+}
+
+private func samePath(_ lhs: String, _ rhs: String) -> Bool {
+    URL(fileURLWithPath: lhs).standardizedFileURL.resolvingSymlinksInPath().path
+        == URL(fileURLWithPath: rhs).standardizedFileURL.resolvingSymlinksInPath().path
+}
+
+private func mountAttachedVolume(_ bundle: URL) -> URL? {
+    guard let info = runPlist(launch: "/usr/bin/hdiutil", args: ["info", "-plist"]),
+          let images = info["images"] as? [[String: Any]] else { return nil }
+    let apfs = "41504653-0000-11AA-AA11-00306543ECAC"
+    for image in images {
+        guard let path = image["image-path"] as? String, samePath(path, bundle.path) else { continue }
+        let entities = image["system-entities"] as? [[String: Any]] ?? []
+        for entity in entities {
+            if let point = entity["mount-point"] as? String, isBackupVolume(URL(fileURLWithPath: point)) {
+                return URL(fileURLWithPath: point)
+            }
+        }
+        let devs = entities.compactMap { entity -> String? in
+            guard (entity["content-hint"] as? String) == apfs else { return nil }
+            return entity["dev-entry"] as? String
+        }
+        for dev in devs {
+            _ = runStatus(launch: "/usr/sbin/diskutil", args: ["mount", dev])
+            if let existing = mountedBackup() { return existing }
+        }
+        if let whole = entities.first(where: { ($0["content-hint"] as? String) == "GUID_partition_scheme" }),
+           let dev = whole["dev-entry"] as? String {
+            _ = runStatus(launch: "/usr/sbin/diskutil", args: ["eject", dev])
+        }
+        return nil
     }
     return nil
 }
 
-func ensureMounted(bundle: URL) throws -> URL {
-    if let existing = mountedBackup() { return existing }
+private func runPlist(launch: String, args: [String]) -> [String: Any]? {
     let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
-    task.arguments = ["attach", "-plist", bundle.path]
+    task.executableURL = URL(fileURLWithPath: launch)
+    task.arguments = args
     let pipe = Pipe()
     task.standardOutput = pipe
     task.standardError = Pipe()
-    try task.run()
-    task.waitUntilExit()
-    guard task.terminationStatus == 0 else {
-        throw CocoaError(.fileReadCorruptFile)
+    do {
+        try task.run()
+    } catch {
+        return nil
     }
+    task.waitUntilExit()
+    guard task.terminationStatus == 0 else { return nil }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    let plist = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
-    let entities = plist?["system-entities"] as? [[String: Any]] ?? []
-    let points = entities.compactMap { $0["mount-point"] as? String }
-    guard let last = points.last else { throw CocoaError(.fileReadUnknown) }
-    return URL(fileURLWithPath: last)
+    return try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+}
+
+@discardableResult
+private func runStatus(launch: String, args: [String]) -> Bool {
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: launch)
+    task.arguments = args
+    task.standardOutput = Pipe()
+    task.standardError = Pipe()
+    do {
+        try task.run()
+    } catch {
+        return false
+    }
+    task.waitUntilExit()
+    return task.terminationStatus == 0
 }
 
 func fileURL(root: URL, file: FileRecord) -> URL {
@@ -601,19 +706,21 @@ final class LibraryDB: @unchecked Sendable {
 
     func setTrashed(_ paths: [String], at time: TimeInterval) {
         queue.sync {
-            guard let stmt = prepare("UPDATE files SET trashed_at=? WHERE path=?") else { return }
-            defer { sqlite3_finalize(stmt) }
-            for path in paths {
-                sqlite3_reset(stmt)
-                sqlite3_clear_bindings(stmt)
-                if time == 0 {
-                    sqlite3_bind_null(stmt, 1)
-                } else {
-                    sqlite3_bind_double(stmt, 1, time)
+            exec("BEGIN")
+            let sql = time == 0
+                ? "DELETE FROM trash WHERE path=?"
+                : "INSERT INTO trash(path, trashed_at) VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET trashed_at=excluded.trashed_at"
+            if let stmt = prepare(sql) {
+                for path in paths {
+                    sqlite3_reset(stmt)
+                    sqlite3_clear_bindings(stmt)
+                    bindText(stmt, 1, path)
+                    if time != 0 { sqlite3_bind_double(stmt, 2, time) }
+                    sqlite3_step(stmt)
                 }
-                bindText(stmt, 2, path)
-                sqlite3_step(stmt)
+                sqlite3_finalize(stmt)
             }
+            exec("COMMIT")
         }
     }
 
@@ -621,12 +728,16 @@ final class LibraryDB: @unchecked Sendable {
         queue.sync {
             let trash = albumTechnicalLocked(id) == "trash"
             let sql = trash
-                ? "SELECT path, year, name FROM files WHERE trashed_at IS NOT NULL ORDER BY trashed_at"
+                ? """
+                SELECT f.path, f.year, f.name
+                FROM trash t JOIN files f ON f.path=t.path
+                ORDER BY t.trashed_at
+                """
                 : """
                 SELECT f.path, f.year, f.name
                 FROM album_files af
                 JOIN files f ON f.path=af.path
-                WHERE af.album_id=? AND f.trashed_at IS NULL
+                WHERE af.album_id=? AND NOT EXISTS (SELECT 1 FROM trash t WHERE t.path=f.path)
                 ORDER BY af.sort_order, f.name
                 """
             guard let stmt = prepare(sql) else { return [] }
@@ -640,31 +751,9 @@ final class LibraryDB: @unchecked Sendable {
         }
     }
 
-    func forget(_ paths: [String]) {
+    func forget(_ paths: [String], years: [String: (count: Int, bytes: Int64)]) {
         queue.sync {
-            exec("BEGIN")
-            if let group = prepare("DELETE FROM group_files WHERE path=?"),
-               let album = prepare("DELETE FROM album_files WHERE path=?"),
-               let file = prepare("DELETE FROM files WHERE path=?") {
-                for path in paths {
-                    for stmt in [group, album, file] {
-                        sqlite3_reset(stmt)
-                        sqlite3_clear_bindings(stmt)
-                        bindText(stmt, 1, path)
-                        sqlite3_step(stmt)
-                    }
-                }
-                sqlite3_finalize(group)
-                sqlite3_finalize(album)
-                sqlite3_finalize(file)
-            }
-            exec("""
-            UPDATE years SET
-              file_count=(SELECT COUNT(*) FROM files WHERE files.year=years.year),
-              total_bytes=(SELECT IFNULL(SUM(size),0) FROM files WHERE files.year=years.year),
-              updated_at=\(Date().timeIntervalSince1970)
-            """)
-            exec("COMMIT")
+            forgetLocked(paths, years: years)
         }
     }
 
@@ -672,8 +761,9 @@ final class LibraryDB: @unchecked Sendable {
         queue.sync {
             let cutoff = now - TrashPolicy.keepSeconds
             guard let stmt = prepare("""
-                SELECT path, year, name FROM files
-                WHERE trashed_at IS NOT NULL AND trashed_at<=?
+                SELECT f.path, f.year, f.name
+                FROM trash t JOIN files f ON f.path=t.path
+                WHERE t.trashed_at<=?
             """) else { return [] }
             defer { sqlite3_finalize(stmt) }
             sqlite3_bind_double(stmt, 1, cutoff)
@@ -687,7 +777,10 @@ final class LibraryDB: @unchecked Sendable {
 
     func trashedFiles() -> [DiskFile] {
         queue.sync {
-            guard let stmt = prepare("SELECT path, year, name FROM files WHERE trashed_at IS NOT NULL") else { return [] }
+            guard let stmt = prepare("""
+                SELECT f.path, f.year, f.name
+                FROM trash t JOIN files f ON f.path=t.path
+            """) else { return [] }
             defer { sqlite3_finalize(stmt) }
             var out: [DiskFile] = []
             while sqlite3_step(stmt) == SQLITE_ROW {
@@ -866,8 +959,10 @@ final class LibraryDB: @unchecked Sendable {
             var files: [FileRecord] = []
             var pending: [WorkItem] = []
             if let stmt = prepare("""
-                SELECT path, year, name, ext, kind, size, width, height, thumb_state, created, trashed_at
-                FROM files
+                SELECT f.path, f.year, f.name, f.ext, f.kind, f.size, f.width, f.height, f.thumb_state, f.created,
+                       t.trashed_at
+                FROM files f
+                LEFT JOIN trash t ON t.path=f.path
             """) {
                 defer { sqlite3_finalize(stmt) }
                 while sqlite3_step(stmt) == SQLITE_ROW {
@@ -886,7 +981,8 @@ final class LibraryDB: @unchecked Sendable {
                         width: Int(sqlite3_column_int(stmt, 6)),
                         height: Int(sqlite3_column_int(stmt, 7)),
                         created: created,
-                        trashedAt: trashed
+                        trashedAt: trashed,
+                        thumbPending: sqlite3_column_int(stmt, 8) == 0
                     )
                     files.append(record)
                     if sqlite3_column_int(stmt, 8) == 0 {
@@ -987,6 +1083,22 @@ final class LibraryDB: @unchecked Sendable {
             exec("ALTER TABLE files ADD COLUMN trashed_at REAL")
         }
         exec("CREATE INDEX IF NOT EXISTS files_trashed ON files(trashed_at)")
+        exec("""
+        CREATE TABLE IF NOT EXISTS trash (
+          path TEXT PRIMARY KEY,
+          trashed_at REAL NOT NULL
+        );
+        """)
+        // The time lives in a tiny table. Updating files would rewrite each
+        // thumbnail blob and wait on the external disk.
+        if metaValue("trash_split") != "1" {
+            exec("""
+            INSERT OR IGNORE INTO trash(path, trashed_at)
+            SELECT path, trashed_at FROM files WHERE trashed_at IS NOT NULL
+            """)
+            exec("UPDATE files SET trashed_at=NULL WHERE trashed_at IS NOT NULL")
+            setMeta("trash_split", "1")
+        }
         ensureTechnicalAlbums()
     }
 
@@ -1027,11 +1139,11 @@ final class LibraryDB: @unchecked Sendable {
         if let stmt = prepare("""
             SELECT a.id, a.uuid, a.name, a.kind, a.technical,
               CASE WHEN a.technical='trash' THEN (
-                SELECT COUNT(*) FROM files WHERE trashed_at IS NOT NULL
+                SELECT COUNT(*) FROM trash
               ) ELSE (
                 SELECT COUNT(*) FROM album_files af
-                JOIN files f ON f.path=af.path
-                WHERE af.album_id=a.id AND f.trashed_at IS NULL
+                WHERE af.album_id=a.id
+                  AND NOT EXISTS (SELECT 1 FROM trash t WHERE t.path=af.path)
               ) END
             FROM albums a
             ORDER BY CASE a.kind WHEN 'user' THEN 0 WHEN 'technical' THEN 1 ELSE 2 END,
@@ -1054,7 +1166,6 @@ final class LibraryDB: @unchecked Sendable {
             SELECT af.album_id, af.path
             FROM album_files af
             JOIN files f ON f.path=af.path
-            WHERE f.trashed_at IS NULL
         """) {
             defer { sqlite3_finalize(stmt) }
             while sqlite3_step(stmt) == SQLITE_ROW {
@@ -1062,7 +1173,7 @@ final class LibraryDB: @unchecked Sendable {
             }
         }
         if let trash = albums.first(where: { $0.isTrash }),
-           let stmt = prepare("SELECT path FROM files WHERE trashed_at IS NOT NULL") {
+           let stmt = prepare("SELECT path FROM trash") {
             defer { sqlite3_finalize(stmt) }
             var set: Set<String> = []
             while sqlite3_step(stmt) == SQLITE_ROW {
@@ -1094,8 +1205,9 @@ final class LibraryDB: @unchecked Sendable {
     private func expiredFilesUnlocked(_ now: TimeInterval) -> [DiskFile] {
         let cutoff = now - TrashPolicy.keepSeconds
         guard let stmt = prepare("""
-            SELECT path, year, name FROM files
-            WHERE trashed_at IS NOT NULL AND trashed_at<=?
+            SELECT f.path, f.year, f.name
+            FROM trash t JOIN files f ON f.path=t.path
+            WHERE t.trashed_at<=?
         """) else { return [] }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_double(stmt, 1, cutoff)
@@ -1107,20 +1219,42 @@ final class LibraryDB: @unchecked Sendable {
     }
 
     private func removeDiskAndRows(_ files: [DiskFile], mount: URL) -> Int {
-        guard !files.isEmpty else { return 0 }
-        var gone: [String] = []
-        for file in files {
-            if MediaDelete.remove(file, mount: mount) {
-                gone.append(file.path)
+        let paths = files.map(\.path)
+        guard !paths.isEmpty else { return 0 }
+        var byYear: [String: (count: Int, bytes: Int64)] = [:]
+        if let stmt = prepare("SELECT year, size FROM files WHERE path=?") {
+            for path in paths {
+                sqlite3_reset(stmt)
+                sqlite3_clear_bindings(stmt)
+                bindText(stmt, 1, path)
+                if sqlite3_step(stmt) == SQLITE_ROW {
+                    let year = columnText(stmt, 0)
+                    let size = sqlite3_column_int64(stmt, 1)
+                    let prior = byYear[year] ?? (0, 0)
+                    byYear[year] = (prior.count + 1, prior.bytes + size)
+                }
+            }
+            sqlite3_finalize(stmt)
+        }
+        forgetLocked(paths, years: byYear)
+        let mountCopy = mount
+        let doomed = files
+        DispatchQueue.global(qos: .utility).async {
+            for file in doomed {
+                _ = MediaDelete.remove(file, mount: mountCopy)
             }
         }
-        guard !gone.isEmpty else { return 0 }
+        return paths.count
+    }
+
+    private func forgetLocked(_ paths: [String], years: [String: (count: Int, bytes: Int64)]) {
         exec("BEGIN")
         if let group = prepare("DELETE FROM group_files WHERE path=?"),
            let album = prepare("DELETE FROM album_files WHERE path=?"),
+           let bin = prepare("DELETE FROM trash WHERE path=?"),
            let file = prepare("DELETE FROM files WHERE path=?") {
-            for path in gone {
-                for stmt in [group, album, file] {
+            for path in paths {
+                for stmt in [group, album, bin, file] {
                     sqlite3_reset(stmt)
                     sqlite3_clear_bindings(stmt)
                     bindText(stmt, 1, path)
@@ -1129,15 +1263,29 @@ final class LibraryDB: @unchecked Sendable {
             }
             sqlite3_finalize(group)
             sqlite3_finalize(album)
+            sqlite3_finalize(bin)
             sqlite3_finalize(file)
         }
-        exec("""
-        UPDATE years SET
-          file_count=(SELECT COUNT(*) FROM files WHERE files.year=years.year),
-          total_bytes=(SELECT IFNULL(SUM(size),0) FROM files WHERE files.year=years.year)
-        """)
+        if let stmt = prepare("""
+            UPDATE years SET
+              file_count=MAX(0, file_count - ?),
+              total_bytes=MAX(0, total_bytes - ?),
+              updated_at=?
+            WHERE year=?
+        """) {
+            let now = Date().timeIntervalSince1970
+            for (year, stat) in years {
+                sqlite3_reset(stmt)
+                sqlite3_clear_bindings(stmt)
+                sqlite3_bind_int(stmt, 1, Int32(stat.count))
+                sqlite3_bind_int64(stmt, 2, stat.bytes)
+                sqlite3_bind_double(stmt, 3, now)
+                bindText(stmt, 4, year)
+                sqlite3_step(stmt)
+            }
+            sqlite3_finalize(stmt)
+        }
         exec("COMMIT")
-        return gone.count
     }
 
     // Photo dates come from manifest.jsonl. This does not read image files or rebuild thumbnails.

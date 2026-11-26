@@ -63,6 +63,7 @@ struct MonthGrid: NSViewRepresentable {
 
     func updateNSView(_ scroll: MonthScrollView, context: Context) {
         let coordinator = context.coordinator
+        let hadDatabase = coordinator.database != nil
         coordinator.sections = sections
         coordinator.database = database
         coordinator.indexer = indexer
@@ -97,6 +98,8 @@ struct MonthGrid: NSViewRepresentable {
         }
         if dataChanged || thumbChanged {
             coordinator.fit(force: true)
+        } else if !hadDatabase, database != nil {
+            collection.reloadItems(at: collection.indexPathsForVisibleItems())
         }
         if coordinator.appliedScroll != scrollToken {
             coordinator.appliedScroll = scrollToken
@@ -148,6 +151,7 @@ struct MonthGrid: NSViewRepresentable {
         private var fitting = false
         private var lastMonth: Int?
         private var clickedPath: IndexPath?
+        private var anchorPath: String?
 
         func attach(scroll: MonthScrollView, collection: NSCollectionView) {
             self.collection = collection
@@ -245,6 +249,9 @@ struct MonthGrid: NSViewRepresentable {
 
         func applySelection(_ selection: Set<String>) {
             guard let collection else { return }
+            if selection.count == 1, let only = selection.first {
+                anchorPath = only
+            }
             var indexes = Set<IndexPath>()
             for (section, bucket) in sections.enumerated() {
                 for (item, file) in bucket.files.enumerated() where selection.contains(file.path) {
@@ -275,6 +282,7 @@ struct MonthGrid: NSViewRepresentable {
             let file = files[indexPath.item]
             cell.show(file, database: database, indexer: indexer)
             cell.onOpen = { [weak self] in self?.onOpen(file) }
+            cell.onShift = { [weak self] in self?.extendSelection(to: file.path) }
             return cell
         }
 
@@ -332,11 +340,43 @@ struct MonthGrid: NSViewRepresentable {
 
         func collectionView(_ collectionView: NSCollectionView, didSelectItemsAt indexPaths: Set<IndexPath>) {
             guard !suppressSelection else { return }
+            if indexPaths.count == 1, let path = indexPaths.first, let file = file(at: path) {
+                anchorPath = file.path
+            }
             publishSelection()
         }
 
         func collectionView(_ collectionView: NSCollectionView, didDeselectItemsAt indexPaths: Set<IndexPath>) {
             guard !suppressSelection else { return }
+            if indexPaths.count == 1,
+               let path = indexPaths.first,
+               let file = file(at: path),
+               NSEvent.modifierFlags.contains(.command) {
+                anchorPath = file.path
+            }
+            publishSelection()
+        }
+
+        /// NSCollectionView keeps a shift-click inside one month. The range follows the grid order, including later months.
+        func extendSelection(to path: String) {
+            guard let collection else { return }
+            var ordered: [String] = []
+            var indexByPath: [String: IndexPath] = [:]
+            for (section, bucket) in sections.enumerated() {
+                for (item, file) in bucket.files.enumerated() {
+                    ordered.append(file.path)
+                    indexByPath[file.path] = IndexPath(item: item, section: section)
+                }
+            }
+            guard let end = ordered.firstIndex(of: path) else { return }
+            let anchor = anchorPath.flatMap { indexByPath[$0] == nil ? nil : $0 } ?? path
+            guard let start = ordered.firstIndex(of: anchor) else { return }
+            let indexes = Set(ordered[min(start, end)...max(start, end)].compactMap { indexByPath[$0] })
+            if anchorPath == nil { anchorPath = path }
+            suppressSelection = true
+            collection.deselectItems(at: collection.selectionIndexPaths)
+            collection.selectItems(at: indexes, scrollPosition: [])
+            suppressSelection = false
             publishSelection()
         }
 
@@ -562,6 +602,7 @@ final class MonthHeader: NSView, NSCollectionViewElement {
 
 final class MonthItem: NSCollectionViewItem {
     var onOpen: (() -> Void)?
+    var onShift: (() -> Void)?
     private let photo = ThumbWell()
     private let badge = NSImageView()
     private let nameField = NSTextField(labelWithString: "")
@@ -666,11 +707,16 @@ final class MonthItem: NSCollectionViewItem {
         path = ""
         photo.image = nil
         onOpen = nil
+        onShift = nil
     }
 
     override func mouseDown(with event: NSEvent) {
         if event.clickCount == 2 {
             onOpen?()
+            return
+        }
+        if event.modifierFlags.contains(.shift), !event.modifierFlags.contains(.command) {
+            onShift?()
             return
         }
         super.mouseDown(with: event)

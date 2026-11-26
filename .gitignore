@@ -4,6 +4,12 @@ library.sqlite
 library.sqlite-journal
 library.sqlite-wal
 library.sqlite-shm
+catalog.sqlite
+catalog.sqlite-journal
+catalog.sqlite-wal
+catalog.sqlite-shm
+catalog.sqlite.building
+mount-device.txt
 manifest.jsonl
 missing.txt
 Photo Backup.app/

@@ -35,7 +35,7 @@ Count at export time: 30854 database rows, 30849 files on disk.
 
 ## Albums
 
-`python3 scripts/migrate_albums.py` copies album membership into `library.sqlite` (`albums`, `album_files`). Quit the browser first. The Photos library is opened read-only. Trash in the browser is `files.trashed_at`: restore clears it, permanent delete removes the archive file, and a launch-time pass deletes rows older than 30 days. Details are in `README.md` in English and Russian.
+`python3 scripts/migrate_albums.py` copies album membership into `library.sqlite` (`albums`, `album_files`). Quit the browser first. The Photos library is opened read-only. Trash in the browser is the `trash` table (`trashed_at` is the Unix time of that write): restore deletes the row, permanent delete removes the archive file off the main thread, and a launch-time pass deletes rows older than 30 days. The still viewer zooms with the trackpad pinch, smart magnify, and two-finger pan. Details are in `README.md` in English and Russian.
 
 ## Date rule
 

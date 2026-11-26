@@ -51,6 +51,7 @@ struct MosaicGrid: NSViewRepresentable {
 
     func updateNSView(_ scroll: MosaicScroll, context: Context) {
         let coordinator = context.coordinator
+        let hadDatabase = coordinator.database != nil
         coordinator.database = database
         coordinator.indexer = indexer
         coordinator.groups = groups
@@ -79,6 +80,8 @@ struct MosaicGrid: NSViewRepresentable {
         if filesChanged || cellChanged {
             coordinator.fit(force: true)
             canvas?.needsDisplay = true
+            coordinator.loadVisible()
+        } else if !hadDatabase, database != nil {
             coordinator.loadVisible()
         }
         if coordinator.appliedScroll != scrollToken {

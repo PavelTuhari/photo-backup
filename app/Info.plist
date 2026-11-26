@@ -17,9 +17,9 @@
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.1</string>
+  <string>1.2</string>
   <key>CFBundleVersion</key>
-  <string>12</string>
+  <string>16</string>
   <key>NSRemovableVolumesUsageDescription</key>
   <string>Photo Backup читает фото, видео и свою базу миниатюр с этого съёмного диска.</string>
   <key>LSApplicationCategoryType</key>
